@@ -1,0 +1,5 @@
+batch_size,bitsandbytes_nf4_total_decode_tps,awq_marlin_total_decode_tps,speedup_x,measurement_status
+1,53,132,2.49,author_reported_local_followup
+2,40,253,6.38,author_reported_local_followup
+4,77,466,6.08,author_reported_local_followup
+8,144,794,5.53,author_reported_local_followup

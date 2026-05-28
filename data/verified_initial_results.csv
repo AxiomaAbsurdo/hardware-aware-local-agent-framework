@@ -1,0 +1,12 @@
+category,metric,value,source_status
+baseline_inference,median_decode_tps,55.92,uploaded_phase_3_summary
+baseline_inference,median_ttft_ms,56.4,uploaded_phase_3_summary
+baseline_inference,peak_vram_gib,3.98,uploaded_phase_3_summary
+qlora_canary,initial_loss,2.84,uploaded_phase_3_summary
+qlora_canary,final_loss,0.50,uploaded_phase_3_summary
+qlora_canary,loss_reduction_percent,82.26,uploaded_phase_3_summary
+qlora_training,peak_vram_gib,5.12,uploaded_phase_3_summary
+cuda_oxide_vecadd,max_absolute_error,0.0,uploaded_phase_3_summary
+cuda_oxide_vecadd,median_latency_us,19.5,uploaded_phase_3_summary
+cuda_oxide_vecadd,effective_bandwidth_gib_s,601.67,uploaded_phase_3_summary
+profile_bottleneck,bnb_kgemm_4bit_inference_naive_self_cuda_percent,27.17,uploaded_profile_report

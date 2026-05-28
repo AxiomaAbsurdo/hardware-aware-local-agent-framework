@@ -1,0 +1,11 @@
+finding_category,item,reported_architecture_or_value,implication,status
+primitive_support,cuda-device/src/wgmma.rs,sm_90a Hopper,Not usable for RTX 3090 sm_86,inspected
+primitive_support,cuda-device/src/tcgen05.rs,sm_100 Blackwell,Not usable for RTX 3090 sm_86,inspected
+primitive_support,cuda-device/src/tma.rs,sm_90+,Not usable for RTX 3090 sm_86,inspected
+primitive_support,cuda-device/src/cluster.rs,sm_90+,Not usable for RTX 3090 sm_86,inspected
+primitive_support,Ampere mma.sync or WMMA abstraction,None identified in supplied inspection,Required capability gap for proposed AWQ tensor-core target,blocked
+awq_layout,weight_bits,4,Recorded AWQ model contract,completed
+awq_layout,group_size,128,Recorded AWQ model contract,completed
+awq_layout,zero_point,true,Recorded AWQ model contract,completed
+runtime_boundary,dispatch_path,AWQMarlinLinearMethod.apply -> apply_awq_marlin_linear -> ops.gptq_marlin_gemm,Reference replacement boundary captured,completed
+decision,proposed cuda-oxide AWQ quantized-linear target,ABANDON_PROPOSED_KERNEL_TARGET,Stopped before kernel implementation,final

@@ -1,0 +1,56 @@
+name: Deploy whitepaper to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Quarkdown
+        run: |
+          set -euo pipefail
+          QD_VERSION="v2.1.2"
+          curl -fL -o quarkdown.zip \
+            "https://github.com/iamgio/quarkdown/releases/download/${QD_VERSION}/quarkdown-linux-x64.zip"
+          unzip -q quarkdown.zip -d "$HOME/quarkdown"
+          QD_BIN="$(find "$HOME/quarkdown" -type f -name quarkdown -path '*/bin/*' | head -n1)"
+          chmod +x "$QD_BIN"
+          echo "$(dirname "$QD_BIN")" >> "$GITHUB_PATH"
+
+      - name: Build site
+        run: quarkdown c main.qd --out dist --out-name site --strict
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

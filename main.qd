@@ -1,0 +1,446 @@
+.doctype {paged}
+
+# A Hardware-Aware Local LLM Framework on a Single RTX 3090
+
+## Measured Fine-Tuning, Quantized Serving, Context Memory, Agent Learning, and the Decision Boundary for Custom Rust-to-PTX Kernels
+
+**Draft white paper for technical review**  
+**Author:** Matias Ivan Mortara Silva  
+**Date:** 27 May 2026  
+**Status:** Working draft - updated after the cuda-oxide inspection-gate decision; local benchmark and source-inspection artifacts should be archived before public submission.
+
+.tableofcontents
+
+## Abstract
+
+This paper presents the design and initial experimental validation of a local large language model (LLM) framework built around a single NVIDIA RTX 3090 GPU with 24 GB class memory and Ampere `sm_86` execution capability. The central design problem is not merely how to execute a model locally, but how to assign distinct technologies to model adaptation, efficient serving, agent context, reinforcement-based improvement, and systems-level kernel research without conflating their roles. A first implementation validated 4-bit QLoRA adaptation of Mistral-7B-Instruct-v0.3, obtaining a controlled canary loss reduction from 2.84 to 0.50 and successful adapter behavior while using 5.12 GiB peak GPU memory. It also validated cuda-oxide as an executable Rust-to-PTX development path on the RTX 3090 through a bit-exact vector addition test. Profiling of a bitsandbytes NF4 inference baseline identified `kgemm_4bit_inference_naive` as the hottest measured decode kernel at 27.17 percent of captured GPU time.
+
+A subsequent local comparison tested the initial custom-kernel hypothesis against an existing optimized runtime. Under short-context decode, vLLM with AWQ-Marlin achieved 130.4 tokens/s compared with 55.4 tokens/s for bitsandbytes NF4 at batch size one, and scaled to 794 tokens/s at batch size eight compared with 144 tokens/s for bitsandbytes. In contrast, at an 8192-token input context, the two backends converged at approximately 6.1 tokens/s. A gated follow-up inspection then examined whether cuda-oxide could credibly implement an AWQ-compatible W4A16 linear competitor on `sm_86`. The inspection report found that cuda-oxide v0.1.0 exposes Hopper- and Blackwell-oriented matrix-memory primitives but no Ampere `mma.sync` or WMMA abstraction needed to pursue the proposed tensor-core kernel on the RTX 3090. No quantized-linear kernel was written or benchmarked after this blocker was identified.
+
+These findings provide two independent reasons not to build the proposed cuda-oxide serving kernel: AWQ-Marlin already resolves the short-context quantized-linear gap in measured end-to-end serving, and the inspected cuda-oxide capability surface does not currently provide the Ampere tensor-core path required for a credible AWQ-Marlin competitor. The resulting framework uses QLoRA and bitsandbytes for supervised adaptation, vLLM and AWQ-Marlin for serving, OpenViking as the intended context database layer, OpenPipe ART as a research path for reinforcement-trained tool use, and cuda-oxide only for future targets whose required primitives and benchmark justification are established in advance.
+
+## Keywords
+
+Local LLMs; RTX 3090; QLoRA; vLLM; AWQ-Marlin; cuda-oxide; OpenViking; Agent Reinforcement Trainer; quantized inference; hardware-aware systems.
+
+## 1. Introduction
+
+Local LLM deployment on consumer-class accelerators increasingly requires a systems view rather than a single-library choice. A model may require memory-efficient adaptation, low-latency inference, multi-request serving, persistent context retrieval, agent training, and optional low-level optimization. Each function stresses a different part of the stack. A framework that treats one tool as responsible for all of these concerns tends either to over-engineer the wrong component or to optimize a workload that is not dominant in use.
+
+This work began from a concrete hardware opportunity: an RTX 3090 workstation on which cuda-oxide, an experimental Rust-to-CUDA compiler that emits PTX, had become executable. The initial hypothesis was that custom kernels could accelerate local inference, particularly quantized linear operations or fused attention. The investigation then adopted a measurement-first sequence: validate fine-tuning, benchmark baseline inference, profile bottlenecks, validate the cuda-oxide execution path, and compare the identified low-level optimization target with an already optimized serving backend.
+
+The paper makes five contributions:
+
+1. It defines a layered local LLM framework in which supervised adaptation, serving, context memory, agent reinforcement learning, and GPU-kernel research are explicitly separated.
+2. It reports an experimentally validated single-GPU training and serving baseline on an RTX 3090, including QLoRA canary adaptation and cuda-oxide execution readiness.
+3. It presents local throughput measurements showing that AWQ-Marlin dominates bitsandbytes NF4 in short-context and batched decode, but that the advantage disappears at 8K input context.
+4. It reports an inspection-gated feasibility result: for the proposed AWQ-compatible Ampere quantized-linear target, the examined cuda-oxide v0.1.0 capability surface lacks an exposed `mma.sync` or WMMA abstraction for `sm_86`, so implementation was stopped before writing a non-competitive prototype.
+5. It converts the evidence into an engineering decision: production serving should remain on AWQ-Marlin, while cuda-oxide is retained only for targets supported by its available primitives or by a future Ampere tensor-core extension.
+
+## 2. Evidence Status and Claims Boundary
+
+This is a working white-paper draft. The evidence is organized into four categories:
+
+| Evidence class | Included material | Claim strength |
+|---|---|---|
+| Attached local reports | Initial Mistral NF4 baseline, profiler summary, QLoRA canary result, cuda-oxide vector-add acceptance result | Measured and traceable to supplied reports |
+| Author-supplied follow-up local summary | AWQ-Marlin versus bitsandbytes context and batch scaling tables | Treated as measured for design discussion; raw records should be archived with a public version |
+| Attached cuda-oxide inspection-gate result | Capability inspection, vLLM/AWQ-Marlin dispatch boundary, stopped implementation decision | Treated as an implementation result; source revisions and inspected lines should be archived for publication |
+| Official project sources and papers | QLoRA, vLLM/PagedAttention, Marlin, cuda-oxide, OpenViking, OpenPipe ART, Quarkdown | Supports technology descriptions and external context, not local performance claims |
+
+The paper does not claim that an LLM-compatible cuda-oxide kernel has been implemented: the proposed AWQ-compatible kernel investigation was stopped at inspection before source implementation. It also does not claim a measured slowdown for an unimplemented cuda-oxide kernel. OpenViking and ART have not yet been experimentally evaluated in the local framework. Those components are included as architectural and research-line elements because an earlier bridge specification exists for OpenViking and ART directly addresses reinforcement learning for tool-using agents.
+
+## 3. System Goal and Research Questions
+
+The framework goal is to support locally adapted, efficiently served, context-aware, and incrementally improvable agents on a single RTX 3090-class workstation.
+
+The evaluation addressed the following questions:
+
+- **RQ1:** Can a 7B instruction model be adapted locally using memory-efficient fine-tuning on the available GPU?
+- **RQ2:** Can cuda-oxide compile and execute correct Ampere-compatible GPU code in the local environment?
+- **RQ3:** Does profiling identify a quantized-linear inference bottleneck that appears suitable for a custom kernel?
+- **RQ4:** Does a mature optimized backend already solve that bottleneck better than a new cuda-oxide implementation is likely to justify?
+- **RQ5:** How does the serving bottleneck change as context length and batch size grow?
+- **RQ6:** What framework architecture best supports future context-memory and agent-learning research without coupling it to an unjustified kernel project?
+- **RQ7:** After an optimized backend is selected, does cuda-oxide expose the Ampere tensor-core primitives required to attempt a credible AWQ-compatible quantized-linear competitor on `sm_86`?
+
+## 4. Framework Architecture
+
+The proposed system is a layered framework rather than a monolithic runtime. Each layer has a distinct evidence level and optimization target.
+
+| Layer | Selected technology | Responsibility | Current status |
+|---|---|---|---|
+| Adaptation | Unsloth / PEFT with QLoRA and bitsandbytes NF4 | Produce LoRA adapters within RTX 3090 memory constraints | Validated through canary adaptation |
+| Production serving | vLLM with AWQ-Marlin | Low-latency and throughput-oriented quantized inference | Locally benchmarked in follow-up evaluation |
+| Context and memory | OpenViking | Structured agent memories, resources, and skills; hierarchical retrieval | Integration specified; experimental validation pending |
+| Agent learning | OpenPipe ART | GRPO-based reinforcement learning for tool-using agent behavior and LoRA updates | Proposed research line; validation pending |
+| Kernel research | cuda-oxide | Rust-to-PTX experimentation for supported remaining GPU operations | Basic execution validated; proposed Ampere AWQ-linear kernel abandoned at inspection gate |
+| Authoring and publication | Quarkdown | Reproducible Markdown-based paper source and later PDF/HTML publication | Used for this draft |
+
+### 4.1 Adaptation lane: QLoRA
+
+QLoRA backpropagates into low-rank adapters while holding the pretrained model in a 4-bit quantized representation, reducing the memory required for fine-tuning [1]. The local framework uses this technique for adaptation rather than requiring a full-precision training deployment. The local canary test is not a domain-quality evaluation; it is an implementation acceptance test showing that a quantized model can learn, save and reload an adapter on the available GPU.
+
+### 4.2 Serving lane: vLLM and AWQ-Marlin
+
+Serving has different objectives from training. vLLM is built around memory-efficient management of the KV cache and high-throughput request handling through PagedAttention [2]. Marlin targets FP16-by-INT4 auto-regressive linear execution and reports near-ideal quantization speedups at medium batch sizes, with end-to-end improvements when integrated with vLLM [3]. vLLM documentation identifies Marlin support for GPTQ/AWQ/FP8 on Ampere hardware, which includes `sm_86` devices such as the RTX 3090 [4].
+
+### 4.3 Context lane: OpenViking
+
+OpenViking is included as a core agent context layer rather than an external afterthought. Its official project describes a context database that unifies agent memories, resources, and skills in a filesystem-style hierarchy with tiered loading and retrieval trajectories [5]. An earlier local integration specification defines an OpenWebUI bridge with live `query_openviking` and `send_to_viking` tools, periodic synchronization into an OpenWebUI Knowledge base, citation behavior, and fallback retrieval. This context layer is conceptually independent from inference-kernel selection: faster decode does not replace organized memory or retrieval observability.
+
+### 4.4 Agent improvement lane: OpenPipe ART
+
+OpenPipe ART is a research extension for improving tool-using behavior. The official project describes an open-source reinforcement-learning framework that integrates GRPO into Python agent applications and supports local GPU operation, with LoRA and vLLM among its cited ecosystem components [6]. In the proposed framework, ART can train an agent to use OpenViking resources, memories, and skills correctly under task-specific rewards. This line targets agent reliability rather than micro-kernel throughput.
+
+### 4.5 Kernel research lane: cuda-oxide
+
+cuda-oxide is not an LLM training or serving backend. Its official documentation describes an early-stage experimental Rust-to-CUDA compiler that compiles Rust kernels to PTX and supports CUDA-style kernel execution and stream-oriented programming [7]. Basic execution on the local RTX 3090 was validated with a vector-add test. However, the later AWQ-linear feasibility inspection reports that the v0.1.0 source surface exposes `wgmma` for Hopper, `tcgen05` for Blackwell, and no `mma.sync` or WMMA abstraction for Ampere `sm_86`. Because the proposed serving experiment required a tensor-core-capable AWQ W4A16 competitor to Marlin on the RTX 3090, implementation was halted at this gate rather than proceeding with an unsuitable CUDA-core-only prototype [12].
+
+The framework therefore places cuda-oxide behind two gates: a profiling gate that establishes an unresolved workload-relevant target, and a capability gate that confirms the required architecture-specific primitives exist. For the proposed quantized-linear target, both gates now reject further implementation: AWQ-Marlin already wins in the relevant measured short-context regime, and the required Ampere tensor-core abstraction was not found in the inspected cuda-oxide version.
+
+## 5. Experimental Platform and Methods
+
+### 5.1 Hardware and model configuration
+
+| Attribute | Value |
+|---|---|
+| GPU | NVIDIA RTX 3090 |
+| GPU architecture | Ampere `sm_86` |
+| Available VRAM reported in experiments | 23.68 GiB |
+| Initial model path | `unsloth/mistral-7b-instruct-v0.3-bnb-4bit` |
+| Model family | Mistral-7B-Instruct-v0.3 |
+| Initial quantization | bitsandbytes NF4 4-bit |
+| Initial compute dtype | bfloat16 |
+| Follow-up optimized serving path | vLLM with AWQ-Marlin |
+| Decoding regime | Greedy decode |
+
+### 5.2 Validation sequence
+
+The experimental workflow separated feasibility from performance:
+
+1. **Environment validation:** confirm CUDA, RTX 3090 execution and memory availability.
+2. **QLoRA canary validation:** train a small LoRA adapter on a deterministic synthetic behavior and verify exact post-training generation.
+3. **Initial inference baseline:** measure NF4 decode throughput, time to first token (TTFT), and memory use.
+4. **Profiler inspection:** capture the dominant GPU operations in batch-size-one decode.
+5. **cuda-oxide readiness validation:** execute a deterministic vector-add GPU kernel and compare outputs against reference results.
+6. **Optimized-backend decision benchmark:** compare bitsandbytes NF4 with AWQ-Marlin across context lengths and batches.
+7. **Kernel feasibility inspection gate:** inspect the cuda-oxide primitives and the vLLM AWQ-Marlin integration contract before implementing a W4A16 competing kernel.
+
+The sequence deliberately prevented a custom-kernel project from being authorized merely because a slow baseline operation existed. A custom implementation was to be considered only if mature alternatives did not eliminate the measured gap and if the compiler toolchain provided the architecture-specific primitives required for a credible competitor.
+
+## 6. Initial Validation Results
+
+### 6.1 Fine-tuning acceptance test
+
+The QLoRA acceptance test trained a LoRA adapter on a controlled canary response. It established that the local adaptation pipeline can modify model behavior, persist the adapter, and reload it successfully.
+
+| Metric | Result |
+|---|---:|
+| Initial training loss | 2.84 |
+| Final training loss | 0.50 |
+| Loss reduction | 82.26% |
+| Required post-training canary output | `CUDA_OXIDE_QLORA_OK_3090` |
+| Generated post-training output | Exact match |
+| Peak QLoRA training VRAM | 5.12 GiB |
+| Trainable parameters | 41.9 million, 1.10% of total |
+| Training speed | 1.18 steps/s |
+
+This result answers RQ1 at the implementation level: local QLoRA adaptation is functional on the RTX 3090. It does not yet establish task-specific quality on a real-world dataset.
+
+### 6.2 Initial inference baseline
+
+| Metric | bitsandbytes NF4 baseline |
+|---|---:|
+| Median decode throughput | 55.92 tokens/s |
+| Median TTFT | 56.4 ms |
+| Peak VRAM allocation | 3.98 GiB |
+
+### 6.3 Bottleneck profile
+
+The single-batch decode profile reported the bitsandbytes 4-bit inference kernel as the dominant measured operation:
+
+| Operation | Self CUDA time share | Calls | Interpretation |
+|---|---:|---:|---|
+| `bitsandbytes::kgemm_4bit_inference_naive` | 27.17% | 6,944 | Primary candidate for quantized-linear optimization in this measured workload |
+| bitsandbytes dequantization kernels, combined | approximately 5.8% | multiple | Additional quantization-related cost |
+| `aten::add` | 4.24% | 13,185 | Residual and elementwise work |
+| `aten::mm` | 3.91% | 256 | Non-quantized projection work |
+
+At this stage, the data supported the hypothesis that a fused dequantization-plus-GEMV kernel might improve short-context, single-request decode. It did not yet support an implementation decision because the baseline had not been compared with a stronger existing quantized serving backend.
+
+### 6.4 cuda-oxide readiness validation
+
+| Metric | Result |
+|---|---:|
+| Test kernel | FP32 vector addition |
+| Vector length | 1,048,576 |
+| Maximum absolute error | 0.0 |
+| Median kernel plus synchronization latency | 19.5 microseconds |
+| Effective bandwidth | 601.67 GiB/s |
+
+This result answers RQ2 narrowly: the local cuda-oxide path can compile and execute a correct Ampere-compatible GPU test. It does not demonstrate an LLM acceleration result.
+
+## 7. Optimized Serving Comparison
+
+### 7.1 Context scaling at batch size one
+
+The follow-up local benchmark compares NF4 inference and AWQ-Marlin under greedy generation of 128 new tokens.
+
+![Decode throughput as context grows.](assets/context_scaling.svg)
+
+| Input context tokens | bitsandbytes NF4 decode t/s | AWQ-Marlin decode t/s | AWQ-Marlin speedup |
+|---:|---:|---:|---:|
+| 128 | 55.4 | 130.4 | 2.35x |
+| 2,048 | 18.8 | 22.4 | 1.19x |
+| 4,096 | 11.5 | 12.3 | 1.07x |
+| 8,192 | 6.11 | 6.10 | 1.00x |
+
+The context experiment reveals two regimes. At short context, the optimized quantized-linear backend substantially changes end-to-end throughput. At long context, the backend choice no longer changes measured decode performance meaningfully. The experiment does not by itself isolate the precise long-context kernel-level cause because a new prefill-only or post-Marlin profile remains to be archived; however, it is sufficient to show that the proposed short-context quantized-linear replacement is not an end-to-end solution for 8K-context inference.
+
+### 7.2 Batch scaling at short context
+
+![Total decode throughput as batch size grows.](assets/batch_scaling.svg)
+
+| Batch size | bitsandbytes NF4 total decode t/s | AWQ-Marlin total decode t/s | AWQ-Marlin speedup |
+|---:|---:|---:|---:|
+| 1 | 53 | 132 | 2.49x |
+| 2 | 40 | 253 | 6.38x |
+| 4 | 77 | 466 | 6.08x |
+| 8 | 144 | 794 | 5.53x |
+
+The batch experiment is decisive for a serving framework. If the system is expected to support concurrent or batched local requests, the current NF4 baseline is not the performance reference that a new kernel needs to beat. AWQ-Marlin is. This finding aligns with Marlin's stated design goal: sustaining quantized inference speedups beyond the tiny-batch regime [3].
+
+### 7.3 Output sanity result
+
+The supplied follow-up summary reports that both tested serving paths passed four of four output-quality sanity prompts with no flags. A public version should attach the prompt suite, output records, exact package versions, model hashes, warmup protocol, repetition counts, and full raw measurements.
+
+## 8. cuda-oxide Inspection Gate: Feasibility of the Proposed Ampere AWQ Kernel
+
+After the AWQ-Marlin benchmark had already produced a no-build decision for the proposed fused quantized-linear kernel, a gated research task was run to determine whether an implementation attempt remained technically plausible. The task was designed to stop before source implementation if the toolchain could not express an appropriate `sm_86` competing path. It stopped at that inspection gate with the decision `ABANDON_PROPOSED_KERNEL_TARGET` [12].
+
+### 8.1 Reported primitive support boundary
+
+The inspection record reports the following capability boundary for the examined cuda-oxide v0.1.0 source tree:
+
+| Inspected cuda-oxide primitive area | Reported target architecture | Relevance to RTX 3090 `sm_86` |
+|---|---|---|
+| `cuda-device/src/wgmma.rs` | `sm_90a` / Hopper | Not available for the target GPU |
+| `cuda-device/src/tcgen05.rs` | `sm_100` / Blackwell | Not available for the target GPU |
+| `cuda-device/src/tma.rs` | `sm_90+` | Not available for the target GPU |
+| `cuda-device/src/cluster.rs` | `sm_90+` | Not available for the target GPU |
+| Ampere `mma.sync` / WMMA abstraction | None identified in inspection | Required gap for the proposed tensor-core competitor |
+
+The same inspection documented the local reference integration boundary as `AWQMarlinLinearMethod.apply` to `apply_awq_marlin_linear` to `ops.gptq_marlin_gemm`, and captured an AWQ configuration with 4-bit weights, group size 128, zero points enabled, and GEMM-oriented metadata [12]. This is useful systems evidence because it identifies both the intended replacement surface and the unfulfilled primitive requirement before implementation effort was committed.
+
+### 8.2 What the inspection does and does not prove
+
+The capability result is a hard blocker for the proposed experiment as scoped: an AWQ-Marlin competitor on Ampere must exploit an appropriate tensor-core execution path, while no corresponding Ampere abstraction was identified in the examined cuda-oxide capability surface. Proceeding with a CUDA-core-only implementation would not be a fair test of whether Rust-to-PTX can match an optimized tensor-core serving kernel.
+
+No quantized-linear cuda-oxide kernel was implemented, integrated, or benchmarked. Consequently, this paper does **not** report a measured performance ratio between a cuda-oxide AWQ kernel and AWQ-Marlin. Any estimated slowdown for an unsupported implementation remains a hypothesis rather than an experimental result.
+
+### 8.3 Completed inspection deliverables and halted work
+
+| Deliverable or work item | Status after inspection gate |
+|---|---|
+| `reports/cuda_oxide_kernel_integration_contract.md` | Completed: AWQ layout, vLLM boundary, zero-copy route, LoRA touchpoint, stream contract and blocker |
+| `reports/awq_checkpoint_layout_snapshot.json` | Completed: 4-bit, group size 128, zero-point-enabled layout and per-layer shapes |
+| `reports/local_vllm_awq_marlin_interface_snapshot.json` | Completed: recorded AWQ-Marlin runtime dispatch boundary |
+| `reports/cuda_oxide_runtime_final_decision.md` and `.json` | Completed: final stopped-decision artifacts |
+| Kernel fixtures, kernel source, runtime bridge, LoRA validation and new benchmarks | Not executed, in accordance with stop conditions |
+
+This result strengthens the earlier performance-based decision through an independent feasibility argument. The existing backend comparison showed that a custom replacement was unnecessary for the measured serving workloads; the inspection gate further showed that the proposed replacement could not be pursued credibly with the inspected cuda-oxide Ampere primitive support.
+
+## 9. Decision: Why the Proposed cuda-oxide Kernel Is Not the Production Next Step
+
+The initial cuda-oxide target was a fused 4-bit dequantization plus GEMV operation intended to replace the bitsandbytes decode bottleneck. The local evidence no longer supports prioritizing that production change, and the later inspection gate rejects implementing this specific target with the inspected cuda-oxide capability surface.
+
+### 9.1 The original target has an existing high-performing replacement
+
+At context 128 and batch size one, AWQ-Marlin provides more than twice the measured throughput of bitsandbytes NF4. At batch sizes two to eight, it provides more than five times the total decode throughput. A cuda-oxide implementation would therefore need to equal AWQ-Marlin numerical behavior and compatibility while exceeding AWQ-Marlin performance, not merely improve on bitsandbytes.
+
+### 9.2 The target does not address the long-context ceiling
+
+At context 8K, AWQ-Marlin and bitsandbytes both measure approximately 6.1 tokens/s. The observed tie means that an improvement limited to the quantized-linear path cannot be assumed to improve the long-context deployment profile. The appropriate next investigation for that regime is a serving-level and profiler-based analysis of prefill, attention, KV-cache memory behavior, context management and request scheduling, not immediate implementation of a GEMV kernel.
+
+### 9.3 Readiness is not acceleration
+
+The cuda-oxide vector-add acceptance test demonstrates toolchain viability. It is important because it de-risks future kernel experiments on Ampere. It does not provide evidence that an LLM-compatible W4A16 or NF4 kernel can be integrated with vLLM, support LoRA, preserve outputs, and exceed Marlin. cuda-oxide is explicitly early-stage alpha software in its official documentation [7].
+
+### 9.4 Production and research requirements differ
+
+A production-serving kernel needs more than speed in an isolated microbenchmark. It must support weight layouts, stream semantics, runtime integration, model changes, LoRA behavior, quality validation, fallback rules and runtime updates. An experimental cuda-oxide kernel may remain valid for a different operation or on hardware supported by the required primitives, but the present evidence places the proposed Ampere AWQ-linear target outside the implementation roadmap. For that target, the project did not fail after an unsuccessful benchmark; it correctly stopped before unnecessary code was written.
+
+## 10. Resulting Framework Design
+
+The measured architecture is summarized as follows:
+
+```text
+Agent client or OpenWebUI
+        |
+        | tool calls and contextual prompts
+        v
+OpenViking context database layer
+  - memories, resources, skills
+  - retrieval and citation path
+        |
+        v
+vLLM serving interface
+  - AWQ-Marlin default production backend
+  - workload-specific runtime profiles
+        ^
+        |
+Accepted model artifacts
+  - base AWQ model or merged/quantized fine-tune
+        ^
+        |
+QLoRA / Unsloth adaptation lane
+  - NF4 training load
+  - LoRA adapter validation
+
+Research loop:
+OpenViking task environments -> ART trajectories and rewards -> LoRA updates -> vLLM evaluation
+
+Experimental side lane only:
+Profiler trigger -> architecture/capability inspection gate -> correctness gate -> champion-backend comparison gate
+
+Current proposed AWQ-linear path on RTX 3090:
+blocked at cuda-oxide Ampere tensor-core capability inspection gate
+```
+
+### 10.1 Serving profiles
+
+The framework should avoid a single default configuration for all workloads:
+
+| Profile | Representative workload | Recommended emphasis |
+|---|---|---|
+| Interactive | Short context, batch size one | AWQ-Marlin low latency and decode throughput |
+| Throughput serving | Short to medium context, batched or concurrent requests | vLLM continuous batching with AWQ-Marlin |
+| Long context | 4K to 8K or longer prompts | KV-cache-aware configuration, context reduction, retrieval and prefill measurement |
+| Adaptation | Fine-tuning or supervised updates | QLoRA with quantized training base and adapter validation |
+| Agent learning | Tool-use and contextual task reliability | ART plus OpenViking test environments, evaluated separately from serving kernels |
+
+### 10.2 Model lifecycle
+
+A practical local artifact lifecycle is:
+
+```text
+Base model
+  -> QLoRA fine-tuning
+  -> adapter quality validation
+  -> merge accepted adapter when required
+  -> quantize serving artifact to AWQ-compatible form
+  -> AWQ-Marlin benchmark and output gate
+  -> serve through vLLM
+```
+
+For development, dynamic LoRA serving can be evaluated separately. For stable releases, merged and re-quantized artifacts offer a simpler serving object, provided quantization quality is checked after merging.
+
+## 11. Context Memory and Agent Learning Research Line
+
+The kernel decision does not reduce the scope of the framework; it redirects the next work to capabilities that directly affect agent usefulness.
+
+### 11.1 OpenViking integration hypothesis
+
+The earlier OpenWebUI-to-OpenViking specification proposes two live tool endpoints, periodic synchronization to a knowledge base, explicit citation requirements, and fallback retrieval if live API calls fail. In framework terms, this is the memory and skills plane. The next validation should determine whether the model retrieves relevant context reliably and whether retrieval provenance is visible in agent responses.
+
+### 11.2 ART research hypothesis
+
+ART provides a plausible loop for improving agent tool use through experience rather than only through supervised domain adaptation. The proposed controlled task is a grounded retrieval environment:
+
+1. Store project resources, synthetic memories and executable skill definitions in OpenViking.
+2. Ask the local agent questions requiring the correct retrieval or skill call.
+3. Reward correct retrieval selection, supported answers, required citations and economical tool use.
+4. Penalize hallucinated claims, wrong memory selection and unnecessary calls.
+5. Use ART to train LoRA updates and evaluate whether success rate improves under held-out tasks.
+
+This work should be measured separately from throughput. Performance metrics include task completion, retrieval precision, citation compliance, tool-call efficiency, latency and memory consumption. Inference speed matters for rollout cost, but it is not a substitute for agent reliability.
+
+## 12. Future cuda-oxide Research Gate
+
+cuda-oxide remains part of the research framework under a strict trigger. A future prototype is justified only when all conditions below hold:
+
+| Gate | Required evidence |
+|---|---|
+| Remaining bottleneck | Profiling after the current best backend identifies a material operation not acceptably addressed by existing kernels |
+| Workload relevance | The bottleneck occurs in the intended deployment workload, not only in an artificial microbenchmark |
+| Integration route | A zero-copy, stream-correct serving-runtime integration is feasible |
+| Correctness | Output agrees with the reference implementation under appropriate numerical and model-quality tests |
+| Compatibility | Supported model layouts, LoRA behavior and runtime update boundaries are explicit |
+| Performance | The custom path beats the strongest deployable existing backend by a pre-declared meaningful threshold |
+| Architecture capability | The compiler/toolchain exposes the required primitives for the target GPU and operation; the proposed Ampere AWQ-linear experiment currently fails this gate |
+
+For the inspected cuda-oxide v0.1.0 capability surface, an AWQ-compatible W4A16 competitor on `sm_86` is no longer an actionable experiment unless Ampere tensor-core support is added, exposed through inline PTX or otherwise made available through a documented extension. cuda-oxide may still be academically valuable for non-tensor-core targets that match its present capabilities, such as candidate data-layout transformations, reductions, normalization-adjacent operations or other profiler-supported work; each would require a fresh target-specific justification. A second forward path is to repeat tensor-core kernel research on Hopper or Blackwell hardware where the reported primitive surface is aligned with the device generation.
+
+## 13. Limitations and Reproducibility Requirements
+
+The current draft has several limitations that must be addressed before publication:
+
+- The follow-up AWQ-Marlin tables were supplied as completed local results, but their raw JSONL measurements and environment lock files were not included with the present draft input. They should be attached or published in a replication package.
+- The 8K context convergence strongly suggests that the quantized-linear replacement is not decisive there, but a post-Marlin kernel profile and a prefill-only profile should be reported before assigning exact causality to attention or KV-cache traffic.
+- True asynchronous server concurrency was deferred; batch scaling is useful but is not identical to production multi-client scheduling behavior.
+- GPTQ-Marlin and FP16/BF16 references were deferred. They are useful secondary controls even though the current AWQ-Marlin result is sufficient for the immediate no-build decision.
+- The QLoRA validation is a canary correctness test, not a real application benchmark.
+- OpenViking and ART are currently architectural or specified research components; their agent-quality experiments remain future work.
+- The new cuda-oxide feasibility conclusion is derived from a supplied inspection result. A publishable replication package should archive the inspected cuda-oxide commit, vLLM version, relevant source excerpts or line references, and the generated integration-contract artifacts.
+- Because the inspection terminated before kernel implementation, no empirical cuda-oxide-versus-Marlin speed ratio is claimed; predicted performance for an unsupported CUDA-core-only path should remain outside the results section.
+- Software versions, hashes, prompts, runtime flags, warmup count, repetition count, power state and GPU process isolation should be documented in the final replication package.
+
+## 14. Conclusion
+
+This work demonstrates a measurement-driven way to construct a local LLM framework on commodity high-end hardware. The RTX 3090 is sufficient to validate QLoRA adaptation of a 7B instruction model and to host efficient quantized serving experiments. cuda-oxide successfully executes a basic Ampere-compatible Rust-to-PTX kernel in the local environment, but the proposed production target - an AWQ-compatible quantized-linear competitor for serving on `sm_86` - is rejected for two independent reasons. First, AWQ-Marlin already substantially improves short-context and batched throughput, while long-context results converge and require a different optimization focus. Second, the gated source inspection identified no Ampere `mma.sync` or WMMA abstraction in the inspected cuda-oxide v0.1.0 capability surface, so the proposed tensor-core competitor was halted before implementation.
+
+The resulting framework is therefore layered: QLoRA for adaptation, vLLM with AWQ-Marlin for serving, OpenViking for organized context and skills, ART for future reinforcement-trained agent tool use, and cuda-oxide only for future experiments whose operation, architecture support and benchmark opportunity are established before coding begins. This separation is not a retreat from low-level optimization; it is a systems decision to stop an invalid target early and direct engineering effort toward measurable, supported and relevant improvements.
+
+## References
+
+[1] T. Dettmers, A. Pagnoni, A. Holtzman, and L. Zettlemoyer. **QLoRA: Efficient Finetuning of Quantized LLMs.** arXiv:2305.14314, 2023. <https://arxiv.org/abs/2305.14314>
+
+[2] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica. **Efficient Memory Management for Large Language Model Serving with PagedAttention.** arXiv:2309.06180, 2023. <https://arxiv.org/abs/2309.06180>
+
+[3] E. Frantar, R. L. Castro, J. Chen, T. Hoefler, and D. Alistarh. **MARLIN: Mixed-Precision Auto-Regressive Parallel Inference on Large Language Models.** arXiv:2408.11743, 2024. <https://arxiv.org/abs/2408.11743>
+
+[4] vLLM Project. **Supported Hardware for Quantization Kernels.** vLLM documentation. <https://docs.vllm.ai/en/latest/features/quantization/>
+
+[5] Volcengine. **OpenViking: An Open-Source Context Database for AI Agents.** Repository documentation. <https://github.com/volcengine/OpenViking>
+
+[6] OpenPipe. **ART: Agent Reinforcement Trainer.** Repository documentation. <https://github.com/OpenPipe/ART>
+
+[7] NVIDIA. **The cuda-oxide Book.** Experimental Rust-to-CUDA compiler documentation, v0.1.0 alpha description. <https://nvlabs.github.io/cuda-oxide/>
+
+[8] iamgio. **Quarkdown: Markdown with superpowers for papers, presentations, websites, books, and knowledge bases.** Repository documentation, v2.1.2 listed as current release at drafting time. <https://github.com/iamgio/quarkdown>
+
+[9] Local experimental record. **Phase 3 + Verification - End-of-session summary.** Unpublished implementation report supplied to the authoring process, 27 May 2026.
+
+[10] Local experimental record. **Profile and cuda-oxide kernel recommendation.** Unpublished profiler report supplied to the authoring process, 27 May 2026.
+
+[11] Local experimental record. **AWQ-Marlin versus bitsandbytes follow-up benchmark summary.** Author-supplied local results for RTX 3090, 27 May 2026; raw replication package pending attachment to a public release.
+
+[12] Local experimental record. **cuda-oxide runtime final decision: inspection-gated abandonment of the proposed AWQ quantized-linear target.** Author-supplied inspection result for cuda-oxide v0.1.0, local vLLM AWQ-Marlin integration boundary and RTX 3090 `sm_86`, 27 May 2026; source revision and generated reports pending archival in a public replication package.
+
+## Appendix A. Data Included with This Draft
+
+The Quarkdown project bundle includes the following structured data files:
+
+| File | Contents |
+|---|---|
+| `data/verified_initial_results.csv` | Initial baseline, QLoRA, profiler and cuda-oxide readiness metrics from supplied reports |
+| `data/context_scaling.csv` | Follow-up context-scaling measurements reported by the author |
+| `data/batch_scaling.csv` | Follow-up batch-scaling measurements reported by the author |
+| `assets/context_scaling.svg` | Figure generated from `context_scaling.csv` |
+| `assets/batch_scaling.svg` | Figure generated from `batch_scaling.csv` |
+| `data/cuda_oxide_inspection_gate.csv` | Reported primitive-support and stop-decision summary for the proposed cuda-oxide AWQ kernel |
+| `source_reports/cuda_oxide_inspection_gate_result.txt` | Supplied inspection-gate result retained as supporting draft evidence |
+
+## Appendix B. Publication Completion Checklist
+
+Before submission to a computer science forum, the following should be completed:
+
+1. Attach raw benchmark JSONL files, configuration manifests and exact runtime commands.
+2. Record software package versions, CUDA and driver versions, model artifact hashes and quantization configuration.
+3. Run or publish the deferred prefill-only and true asynchronous-concurrency experiments.
+4. Add post-Marlin profiler data supporting any stated bottleneck attribution for long context.
+5. Archive OpenViking bridge code and tests if described as implemented rather than specified.
+6. Run an initial ART plus OpenViking grounded tool-use experiment or recast that layer explicitly as future work.
+7. Archive the cuda-oxide and vLLM revisions, the inspected source locations, and the generated kernel-integration contract artifacts supporting the inspection-gate decision.
+8. Select the publication license and remove any private paths, credentials or non-public model artifacts.

@@ -1,0 +1,54 @@
+STOP at inspection gate. Decision: ABANDON_PROPOSED_KERNEL_TARGET
+
+Why we stop before writing the kernel
+
+Architectural blocker, hard. Per direct source inspection:
+
+┌──────────────────────────────────────────┬──────────────────────┐
+│     cuda-oxide v0.1.0 MMA primitives     │     Target arch      │
+├──────────────────────────────────────────┼──────────────────────┤
+│ cuda-device/src/wgmma.rs                 │ sm_90a (Hopper only) │
+├──────────────────────────────────────────┼──────────────────────┤
+│ cuda-device/src/tcgen05.rs               │ sm_100 (Blackwell)   │
+├──────────────────────────────────────────┼──────────────────────┤
+│ cuda-device/src/tma.rs                   │ sm_90+               │
+├──────────────────────────────────────────┼──────────────────────┤
+│ cuda-device/src/cluster.rs               │ sm_90+               │
+├──────────────────────────────────────────┼──────────────────────┤
+│ mma.sync / WMMA for Ampere (sm_80/sm_86) │ NONE                 │
+└──────────────────────────────────────────┴──────────────────────┘
+
+Pipeline feature detector confirms: None_default → sm_80 baseline means no tensor-core abstractions at all for Ampere. Marlin's whole advantage on RTX 3090 (sm_86) is sm_80 tensor cores via mma.sync.aligned.m16n8k16.f16. A cuda-oxide kernel today can only use CUDA cores → would land at 5-20× slower than Marlin, likely also slower than the bnb 55 t/s baseline.
+
+The spec's stop_conditions includes: "stop production consideration if the candidate does not beat AWQ-Marlin under identical local workload measurements." — met before any line of kernel code.
+
+What we DID complete
+
+┌───────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                      Deliverable                      │                                                       Status                                                       │
+├───────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ reports/cuda_oxide_kernel_integration_contract.md     │ ✅ — full contract: AWQ layout, vLLM boundary, zero-copy route, LoRA touchpoint, stream contract, then the blocker │
+├───────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ reports/awq_checkpoint_layout_snapshot.json           │ ✅ — bits=4, group_size=128, zero_point=true, GEMM version, per-layer shapes                                       │
+├───────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ reports/local_vllm_awq_marlin_interface_snapshot.json │ ✅ — AWQMarlinLinearMethod.apply → apply_awq_marlin_linear → ops.gptq_marlin_gemm (C++/CUDA custom op)             │
+├───────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ reports/cuda_oxide_runtime_final_decision.md          │ ✅ — plain language                                                                                                │
+├───────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ reports/cuda_oxide_runtime_final_decision.json        │ ✅ — machine readable                                                                                              │
+└───────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+What we did NOT do (per stop_conditions)
+
+P1 fixtures → P9 maintenance: all skipped. No kernel source, no bridge, no LoRA test, no benchmark. Production stack untouched — vLLM + AWQ-Marlin unchanged. Rollback trivially complete because nothing was deployed.
+
+Reconciliation with prior decision
+
+Today's earlier Benchmark_Existing_LLM_Backends... task already returned DO_NOT_BUILD_PROPOSED_CUDA_OXIDE_KERNEL from measured throughput (no gap left for a custom kernel to close). This task asked to attempt anyway as gated research; the inspection found a second independent reason (toolchain capability gap). Both arguments point to the same disposition.
+
+Productive next steps (NOT in this task's scope)
+
+1. File NVlabs/cuda-oxide GitHub issue asking for Ampere mma.sync intrinsics — unblocks every Ampere LLM kernel project.
+2. Pick a non-tensor-core cuda-oxide target where current primitives DO compete: custom KV-cache packing, RMSNorm, positional encodings, custom reductions.
+3. Inline-PTX support in cuda-oxide as a smaller delta than a full mma dialect.
+4. Park until Hopper/Blackwell where existing WGMMA/tcgen05 apply.

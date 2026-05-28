@@ -1,0 +1,5 @@
+context_tokens,bitsandbytes_nf4_decode_tps,awq_marlin_decode_tps,speedup_x,measurement_status
+128,55.4,130.4,2.35,author_reported_local_followup
+2048,18.8,22.4,1.19,author_reported_local_followup
+4096,11.5,12.3,1.07,author_reported_local_followup
+8192,6.11,6.10,1.00,author_reported_local_followup
