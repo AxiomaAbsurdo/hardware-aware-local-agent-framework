@@ -86,7 +86,26 @@ jobs:
           injected = original.replace("</head>", f"    {meta.replace(chr(10), chr(10) + '    ')}\n  </head>", 1)
           if injected == original:
               raise SystemExit("Could not find </head> to inject meta tags.")
-          path.write_text(injected, encoding="utf-8")
+
+          wrapped = re.sub(
+              r'(<body class="[^"]*">\s*)<div class="paged-content-wrapper">',
+              r'\1<main>\n      <article class="paged-content-wrapper">',
+              injected,
+              count=1,
+          )
+          if wrapped == injected:
+              raise SystemExit("Could not find paged-content-wrapper opening tag for semantic wrap.")
+
+          final = re.sub(
+              r'</div>(\s*)</body>',
+              r'</article>\n    </main>\1</body>',
+              wrapped,
+              count=1,
+          )
+          if final == wrapped:
+              raise SystemExit("Could not find paged-content-wrapper closing tag for semantic wrap.")
+
+          path.write_text(final, encoding="utf-8")
           PY
 
       - name: Upload Pages artifact
