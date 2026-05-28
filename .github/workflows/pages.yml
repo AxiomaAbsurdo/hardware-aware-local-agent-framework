@@ -40,6 +40,55 @@ jobs:
       - name: Build site
         run: quarkdown c main.qd --out dist --out-name site --strict
 
+      - name: Inject social-card meta tags
+        env:
+          SITE_URL: https://axiomaabsurdo.github.io/hardware-aware-local-agent-framework/
+          OG_TITLE: Hardware-Aware Local LLM Framework
+          OG_DESCRIPTION: Design and initial experimental validation of a local LLM framework built around a single NVIDIA RTX 3090 with 24GB and Ampere sm_86.
+          OG_IMAGE_SRC: assets/context_scaling.png
+          OG_IMAGE_NAME: social-card.png
+        run: |
+          set -euo pipefail
+          cp "$OG_IMAGE_SRC" "dist/site/$OG_IMAGE_NAME"
+          python3 <<'PY'
+          import html, os, pathlib, re
+
+          site_url = os.environ["SITE_URL"]
+          if not site_url.endswith("/"):
+              site_url += "/"
+          title = os.environ["OG_TITLE"]
+          desc = os.environ["OG_DESCRIPTION"]
+          img_url = site_url + os.environ["OG_IMAGE_NAME"]
+          esc = lambda s: html.escape(s, quote=True)
+
+          meta = "\n".join([
+              f'<link rel="canonical" href="{esc(site_url)}">',
+              f'<meta property="og:type" content="article">',
+              f'<meta property="og:site_name" content="{esc(title)}">',
+              f'<meta property="og:title" content="{esc(title)}">',
+              f'<meta property="og:description" content="{esc(desc)}">',
+              f'<meta property="og:url" content="{esc(site_url)}">',
+              f'<meta property="og:image" content="{esc(img_url)}">',
+              f'<meta property="og:image:width" content="1584">',
+              f'<meta property="og:image:height" content="924">',
+              f'<meta property="og:image:alt" content="{esc(title)} — context-scaling chart">',
+              f'<meta name="twitter:card" content="summary_large_image">',
+              f'<meta name="twitter:title" content="{esc(title)}">',
+              f'<meta name="twitter:description" content="{esc(desc)}">',
+              f'<meta name="twitter:image" content="{esc(img_url)}">',
+              f'<meta name="twitter:image:alt" content="{esc(title)} — context-scaling chart">',
+          ])
+
+          path = pathlib.Path("dist/site/index.html")
+          original = path.read_text(encoding="utf-8")
+          if "og:title" in original:
+              raise SystemExit("OG meta already injected; aborting to avoid duplicates.")
+          injected = original.replace("</head>", f"    {meta.replace(chr(10), chr(10) + '    ')}\n  </head>", 1)
+          if injected == original:
+              raise SystemExit("Could not find </head> to inject meta tags.")
+          path.write_text(injected, encoding="utf-8")
+          PY
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

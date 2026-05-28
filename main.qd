@@ -1,3 +1,19 @@
+.docname {Hardware-Aware Local LLM Framework}
+.docdescription {Design and initial experimental validation of a local LLM framework built around a single NVIDIA RTX 3090 with 24GB and Ampere sm_86.}
+.doclang {English}
+.docauthors
+  - Matias Ivan Mortara Silva
+.dockeywords
+  - Local LLMs
+  - RTX 3090
+  - QLoRA
+  - vLLM
+  - AWQ-Marlin
+  - cuda-oxide
+  - OpenViking
+  - Agent Reinforcement Trainer
+  - quantized inference
+  - hardware-aware systems
 .doctype {paged}
 
 # A Hardware-Aware Local LLM Framework on a Single RTX 3090
