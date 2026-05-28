@@ -16,7 +16,7 @@
   - hardware-aware systems
 .doctype {paged}
 
-# A Hardware-Aware Local LLM Framework on a Single RTX 3090
+# HALLF: A Hardware-Aware Local LLM Framework on a Single RTX 3090
 
 ## Measured Fine-Tuning, Quantized Serving, Context Memory, Agent Learning, and the Decision Boundary for Custom Rust-to-PTX Kernels
 
