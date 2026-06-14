@@ -402,7 +402,31 @@ The current draft has several limitations that must be addressed before publicat
 - Because the inspection terminated before kernel implementation, no empirical cuda-oxide-versus-Marlin speed ratio is claimed; predicted performance for an unsupported CUDA-core-only path should remain outside the results section.
 - Software versions, hashes, prompts, runtime flags, warmup count, repetition count, power state and GPU process isolation should be documented in the final replication package.
 
-## 14. Conclusion
+## 14. Counterarguments and External Limits
+
+This section records counterarguments to the framework's thesis identified during an external integration review. An exhaustive search for evidence against single-node, hardware-aware execution on an isolated consumer GPU did not yield material that refutes the paper's core methodological claim - separate the lanes and decide by measurement - but it did surface four substantive limits that bound what such a framework can promise. They are reported here so that future work does not over-claim a scheduling or kernel result that the evidence does not support.
+
+### 14.1 KV-cache thrashing bounds the single-node context-scheduling promise
+
+In agentic workloads the theoretical KV-cache reuse rate is high, but production serving systems treat each step as a stateless request. Under concurrency the cache is evicted during tool execution and re-prefilled on the next step - "KV-cache thrashing" - which repeatedly pays the prefill cost already identified in Section 7.1 as the dominant long-context limiter. Offloading the cache to host memory or SSD as a mitigation runs into host-to-device PCIe bandwidth far below on-GPU memory bandwidth, producing a measurable inference slowdown [13]. The KV cache also grows linearly in context length, layer count, batch size and key-value head count; at large context and model size the cache alone can dominate device memory [14]. On a single 24 GiB RTX 3090 this caps the number of concurrent long-context agents independently of any scheduling cleverness: scheduling can manage the memory-traffic ceiling, it cannot remove it.
+
+### 14.2 Telemetry can cost more than the savings it measures
+
+The framework's "measurement, not intuition" stance is sound, but instrumentation is not free. Fine-grained tracing of latency-sensitive inference is subject to an observer effect in which indiscriminate event collection contends for the same resources as inference and can mask the true bottleneck, and naive observability tooling can add tens to hundreds of milliseconds per request [15][16]. A hardware-aware loop that collects per-token telemetry therefore risks spending more than the inference savings it pursues. The supported mitigation is adaptive sampling rather than always-on collection, which a future HALLF telemetry layer should adopt by default.
+
+### 14.3 Unified memory and software abstractions challenge hardware-pinned single-GPU execution
+
+The thesis is built on a dedicated-VRAM consumer GPU. Because batch-one decode is memory-bandwidth-bound, unified-memory systems that give the accelerator direct access to a large shared pool can sidestep the PCIe bottleneck that punishes configurations whose model spills from VRAM into system RAM; reported results show such systems outperforming a higher-bandwidth discrete GPU once a model no longer fits in VRAM [17]. For models that exceed 24 GiB this is a direct architectural counter to pinning the framework to a single RTX 3090, and head-wise offloading research further shows that software memory management can extend feasible context without dedicated VRAM growth. The economic case is also conditional: local hardware amortizes only above a sustained, stable demand threshold, while spiky or seasonal demand favors elastic cloud serving [18]. HALLF's single-3090 binding should therefore be read as a deliberate scope choice for sustained local 7B-class workloads, not as a general claim of optimality.
+
+### 14.4 The recommended remedy is itself lossy
+
+Section 10.1 prescribes context reduction for the long-context profile, and the strongest counterargument is aimed at that very remedy: prompt and context compression are lossy. Reported results reach high compression ratios with small average loss on reasoning tasks, but accuracy collapses on structure-sensitive long-context tasks - passage counting and large-class in-context classification degrade sharply or fail outright at aggressive ratios, and exact-match scores on arithmetic reasoning decline measurably as the ratio rises [19][20][21]. Because compression attacks exactly the long-context, retrieval-heavy regime the framework cares about, any context-reduction layer must be quality-gated against a held-out task suite and must never be applied blindly. This is the explicit reason a correctness gate precedes the performance measurement in any future context-reduction experiment within HALLF.
+
+### 14.5 Net assessment
+
+The counterarguments do not overturn the framework's central decision discipline; if anything they reinforce it, since each limit is best handled by the same measure-then-gate procedure used for the cuda-oxide decision. What they do puncture is any implicit promise of a hardware-pinned scheduling loop that defeats the long-context ceiling: the dominant long-context limiter is KV-cache memory traffic and prefill, telemetry carries a real and sometimes self-defeating cost, unified-memory and cloud alternatives bound the single-GPU binding for large models, and the leading software remedy trades tokens for accuracy. The honest reading is that the framework's next available gain is quality-gated token-budget reduction, not a custom scheduler and not a custom serving kernel - a conclusion consistent with Sections 9 and 10.
+
+## 15. Conclusion
 
 This work demonstrates a measurement-driven way to construct a local LLM framework on commodity high-end hardware. The RTX 3090 is sufficient to validate QLoRA adaptation of a 7B instruction model and to host efficient quantized serving experiments. cuda-oxide successfully executes a basic Ampere-compatible Rust-to-PTX kernel in the local environment, but the proposed production target - an AWQ-compatible quantized-linear competitor for serving on `sm_86` - is rejected for two independent reasons. First, AWQ-Marlin already substantially improves short-context and batched throughput, while long-context results converge and require a different optimization focus. Second, the gated source inspection identified no Ampere `mma.sync` or WMMA abstraction in the inspected cuda-oxide v0.1.0 capability surface, so the proposed tensor-core competitor was halted before implementation.
 
@@ -433,6 +457,24 @@ The resulting framework is therefore layered: QLoRA for adaptation, vLLM with AW
 [11] Local experimental record. **AWQ-Marlin versus bitsandbytes follow-up benchmark summary.** Author-supplied local results for RTX 3090, 27 May 2026; raw replication package pending attachment to a public release.
 
 [12] Local experimental record. **cuda-oxide runtime final decision: inspection-gated abandonment of the proposed AWQ quantized-linear target.** Author-supplied inspection result for cuda-oxide v0.1.0, local vLLM AWQ-Marlin integration boundary and RTX 3090 `sm_86`, 27 May 2026; source revision and generated reports pending archival in a public replication package.
+
+[13] Y. Pan et al. **InstInfer: In-Storage Attention Offloading for Cost-Effective Long-Context LLM Inference.** arXiv:2409.04992, 2024. <https://arxiv.org/pdf/2409.04992>
+
+[14] IBM Redbooks. **Context Without Limits: A High-Performance KV Cache Platform for Large-Scale AI Inference.** MD260021. <https://www.redbooks.ibm.com/docs/MD260021/MD260021.html>
+
+[15] **LatencyPrism: Online Non-intrusive Latency Sculpting for SLO-Guaranteed LLM Inference.** arXiv:2601.09258. <https://arxiv.org/pdf/2601.09258>
+
+[16] **eInfer: Unlocking Fine-Grained Tracing for Distributed LLM Inference.** ACM, 2025. <https://dl.acm.org/doi/pdf/10.1145/3748355.3748372>
+
+[17] **HeadInfer: Memory-Efficient LLM Inference by Head-wise Offloading.** arXiv:2502.12574, 2025. <https://arxiv.org/pdf/2502.12574>
+
+[18] Spheron. **LLM Inference On-Premise vs GPU Cloud: 2026 Cost and Break-Even Analysis.** <https://www.spheron.network/blog/llm-inference-on-premise-vs-cloud/>
+
+[19] **Prompt Compression in the Wild: Measuring Latency, Rate Adherence, and Quality for Faster LLM Inference.** arXiv:2604.02985. <https://arxiv.org/pdf/2604.02985>
+
+[20] Z. Pan et al. **LLMLingua-2: Data Distillation for Efficient and Faithful Task-Agnostic Prompt Compression.** arXiv:2403.12968, 2024. <https://arxiv.org/pdf/2403.12968>
+
+[21] H. Jiang et al. **LongLLMLingua: Accelerating and Enhancing LLMs in Long Context Scenarios via Prompt Compression.** arXiv:2310.06839, 2023. <https://arxiv.org/pdf/2310.06839>
 
 ## Appendix A. Data Included with This Draft
 
